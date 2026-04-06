@@ -32,43 +32,7 @@ How It Works
     Distance matrix: Query the tree to estimate distances for all N×N pairs.
     TSP solving: Multi-start 2-opt with adaptive iteration count.
 
-📈 Performance
-Cities
-	
-Samples
-	
-Starts
-	
-Time (JS)
-	
-Accuracy
-10
-	
-120k
-	
-4k
-	
-~0.3s
-	
-100%
-25
-	
-600k
-	
-15k
-	
-~1.2s
-	
-100%
-50
-	
-1.2M
-	
-72k
-	
-~3.5s
-	
-100%
+
 🧪 Stress Testing
 Try increasing noise to see degradation:
 
