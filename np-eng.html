@@ -1,0 +1,538 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+    <title>JitterTree | Adaptive TSP Solver | Noise-Aware Optimization</title>
+    <style>
+        body { margin: 0; overflow: hidden; font-family: 'Courier New', monospace; background: #05070a; color: #0f0; }
+        #ui-panel {
+            position: absolute; top: 15px; left: 15px; z-index: 100;
+            background: rgba(0,0,0,0.85); backdrop-filter: blur(10px);
+            padding: 16px 20px; border-radius: 14px; border-left: 4px solid #ffaa44;
+            pointer-events: auto; width: 320px;
+        }
+        .control-row { display: flex; align-items: center; gap: 10px; margin: 6px 0; font-size: 13px; }
+        input[type=range] { flex: 1; accent-color: #ffaa44; }
+        .val { min-width: 30px; text-align: right; color: #ffdd99; font-weight: bold; }
+        button {
+            background: #1e2a3a; border: none; color: #ffdd99; padding: 8px 16px;
+            border-radius: 24px; font-weight: bold; cursor: pointer; font-family: monospace;
+            transition: 0.2s; margin-top: 8px; width: 100%;
+        }
+        button:hover { background: #ffaa33; color: #0a0f1a; transform: scale(0.97); }
+        button:disabled { background: #333; color: #666; cursor: not-allowed; }
+        #stats-panel {
+            position: absolute; top: 15px; right: 15px; z-index: 100;
+            background: rgba(0,0,0,0.8); backdrop-filter: blur(10px);
+            padding: 14px 18px; border-radius: 14px; text-align: right; font-size: 12px;
+            border-right: 3px solid #ffaa44; pointer-events: none; min-width: 250px;
+        }
+        .stat-line { margin: 3px 0; line-height: 1.35; }
+        .highlight { color: #88ff88; font-weight: bold; }
+        .formula { color: #aaffaa; font-size: 10px; background: #112; padding: 4px 6px; border-radius: 6px; margin-top: 6px; }
+        .progress-bg { width: 100%; height: 4px; background: #2a3a55; margin-top: 8px; border-radius: 4px; overflow: hidden; }
+        .progress-fill { width: 0%; height: 100%; background: linear-gradient(90deg, #ffaa44, #ff6600); transition: width 0.1s; }
+        .sub { font-size: 10px; color: #888; margin-top: 6px; border-top: 1px solid #333; padding-top: 4px; }
+    </style>
+</head>
+<body>
+    <div id="ui-panel">
+        <div class="control-row">🏙️ Cities: <input type="range" id="citySlider" min="4" max="50" value="15"><span class="val" id="cityVal">15</span></div>
+        <div class="control-row">📡 Noise: <input type="range" id="noiseSlider" min="0" max="0.005" step="0.0001" value="0.00001"><span class="val" id="noiseVal">1e-5</span></div>
+        <div class="formula" id="formulaBox">S=4000·(N/10)¹·⁹⁵ | B=20·(N/10)¹·⁰⁸</div>
+        <button id="runBtn">🚀 RUN CALCULATION</button>
+    </div>
+
+    <div id="stats-panel">
+        <div class="stat-line" id="statusLine">⏳ Waiting...</div>
+        <div class="stat-line" id="metricLine"></div>
+        <div class="progress-bg"><div class="progress-fill" id="progFill"></div></div>
+        <div class="sub" id="noteLine">Adjust parameters and click "Run"</div>
+    </div>
+
+    <script type="importmap">
+        { "imports": { "three": "https://unpkg.com/three@0.128.0/build/three.module.js", "three/addons/": "https://unpkg.com/three@0.128.0/examples/jsm/" } }
+    </script>
+
+    <script type="module">
+        import * as THREE from 'three';
+        import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+        import { CSS2DRenderer, CSS2DObject } from 'three/addons/renderers/CSS2DRenderer.js';
+
+        // ---------- Configuration ----------
+        const PLANE_SIZE = 120;
+        const SPEED_SOUND = 343;
+        const SENSOR_X = [0, PLANE_SIZE, 0, PLANE_SIZE, 60];
+        const SENSOR_Y = [0, 0, PLANE_SIZE, PLANE_SIZE, 60];
+        const SENSOR_Z = [5, 5, 5, 5, 5];
+        const FEATURE_DIM = 10;     // 2 features per sensor (5 sensors)
+
+        // Adaptive formula: parameters scale with number of cities
+        function getAdaptiveConfig(N) {
+            const S0 = 4000, B0 = 20, M0 = 120000, N0 = 10;
+            let starts = Math.floor(S0 * Math.pow(N / N0, 1.95));
+            let branch = Math.floor(B0 * Math.pow(N / N0, 1.08));
+            let samples = Math.floor(M0 * Math.pow(branch / B0, 2));
+            return {
+                starts: Math.min(300000, Math.max(2000, starts)),
+                b1: Math.min(112, Math.max(16, branch)),
+                b2: Math.min(112, Math.max(16, branch)),
+                samples: Math.min(1000000, Math.max(50000, samples)),
+                maxIter: Math.min(2500, Math.floor(N * 40))
+            };
+        }
+
+        // Non-blocking async chunk processor – prevents UI freeze
+        const yieldToUI = () => new Promise(r => setTimeout(r, 0));
+        async function chunkProcess(total, fn, onProgress, chunkSize = 800) {
+            let i = 0;
+            while (i < total) {
+                const end = Math.min(i + chunkSize, total);
+                for (; i < end; i++) fn(i);
+                if (onProgress) onProgress(i / total);
+                await yieldToUI();
+            }
+        }
+
+        // ---------- Global State ----------
+        let cities = [];
+        let scene, camera, renderer, controls, labelRenderer;
+        let cityMeshes = [], routeLine = null;
+        let isRunning = false;
+
+        // DOM elements
+        const citySlider = document.getElementById('citySlider');
+        const noiseSlider = document.getElementById('noiseSlider');
+        const cityVal = document.getElementById('cityVal');
+        const noiseVal = document.getElementById('noiseVal');
+        const statusLine = document.getElementById('statusLine');
+        const metricLine = document.getElementById('metricLine');
+        const progFill = document.getElementById('progFill');
+        const noteLine = document.getElementById('noteLine');
+        const runBtn = document.getElementById('runBtn');
+        const formulaBox = document.getElementById('formulaBox');
+
+        citySlider.oninput = () => {
+            cityVal.textContent = citySlider.value;
+            generateCities(parseInt(citySlider.value));
+        };
+        noiseSlider.oninput = () => {
+            noiseVal.textContent = parseFloat(noiseSlider.value).toExponential(1);
+        };
+        runBtn.onclick = runFullCycle;
+
+        // Generate random cities in 3D space
+        function generateCities(n) {
+            cities = [];
+            for (let i = 0; i < n; i++) {
+                cities.push({
+                    id: i,
+                    x: 15 + Math.random() * (PLANE_SIZE - 30),
+                    y: 15 + Math.random() * (PLANE_SIZE - 30),
+                    z: 10 + Math.random() * 25
+                });
+            }
+            updateVisuals();
+        }
+
+        // ---------- JitterTree: learn distance from acoustic features ----------
+        class JitterTree {
+            constructor(b1, b2) {
+                this.b1 = b1;
+                this.b2 = b2;
+                this.data = null;          // flat array of features + distance
+                this.mins = null;
+                this.maxs = null;
+                this.leaves = [];
+            }
+
+            async build(sampleCount, noiseLevel, onProgress) {
+                const rowLen = FEATURE_DIM + 1;
+                this.data = new Float32Array(sampleCount * rowLen);
+                
+                // Helper random generators
+                const randPos = () => Math.random() * PLANE_SIZE;
+                const randZ = () => 8 + Math.random() * 28;
+                const randNoise = () => (Math.random() - 0.5);
+
+                await chunkProcess(sampleCount, i => {
+                    const idx = i * rowLen;
+                    // Random start and end points
+                    const fx = randPos(), fy = randPos(), fz = randZ();
+                    const tx = randPos(), ty = randPos(), tz = randZ();
+                    const dx = tx - fx, dy = ty - fy, dz = tz - fz;
+                    const dist = Math.hypot(dx, dy, dz);
+                    this.data[idx + FEATURE_DIM] = dist;   // store ground truth distance
+                    
+                    // Compute acoustic features for each sensor
+                    for (let s = 0; s < 5; s++) {
+                        const dA = Math.hypot(fx - SENSOR_X[s], fy - SENSOR_Y[s], fz - SENSOR_Z[s]);
+                        const dB = Math.hypot(tx - SENSOR_X[s], ty - SENSOR_Y[s], tz - SENSOR_Z[s]);
+                        const tA = dA / SPEED_SOUND;
+                        const tB = dB / SPEED_SOUND;
+                        // Mean delay and delta (with jitter noise)
+                        this.data[idx + s * 2]     = (tA + tB) * 0.5 + randNoise() * noiseLevel * 0.002;
+                        this.data[idx + s * 2 + 1] = (tB - tA) / (dist / 9.0 + 0.002) + randNoise() * noiseLevel * 0.0015;
+                    }
+                }, onProgress ? p => onProgress(p * 0.35) : null, 600);
+
+                // Compute min/max per feature for normalization
+                this.mins = new Float32Array(FEATURE_DIM).fill(Infinity);
+                this.maxs = new Float32Array(FEATURE_DIM).fill(-Infinity);
+                await chunkProcess(sampleCount, i => {
+                    const base = i * rowLen;
+                    for (let f = 0; f < FEATURE_DIM; f++) {
+                        const v = this.data[base + f];
+                        if (v < this.mins[f]) this.mins[f] = v;
+                        if (v > this.maxs[f]) this.maxs[f] = v;
+                    }
+                }, onProgress ? p => onProgress(0.35 + p * 0.2) : null, 3000);
+
+                // Build leaf buckets (hierarchical clustering)
+                const totalLeaves = this.b1 * this.b2;
+                const buckets = Array.from({ length: totalLeaves }, () => []);
+                const range = new Float32Array(FEATURE_DIM);
+                for (let f = 0; f < FEATURE_DIM; f++) {
+                    range[f] = Math.max(0.001, this.maxs[f] - this.mins[f]);
+                }
+                const invB1 = 1 / this.b1;
+                const invB2 = 1 / this.b2;
+
+                await chunkProcess(sampleCount, i => {
+                    const base = i * rowLen;
+                    let c1 = 0, c2 = 0;
+                    // Use first 5 features for coarse clustering
+                    for (let s = 0; s < 5; s++) {
+                        c1 += (this.data[base + s * 2] - this.mins[s * 2]) * invB1 / range[s * 2];
+                        c2 += (this.data[base + s * 2 + 1] - this.mins[s * 2 + 1]) * invB2 / range[s * 2 + 1];
+                    }
+                    const idx1 = Math.min(this.b1 - 1, Math.floor(c1));
+                    const idx2 = Math.min(this.b2 - 1, Math.floor(c2));
+                    buckets[idx1 * this.b2 + idx2].push(i);
+                }, onProgress ? p => onProgress(0.55 + p * 0.3) : null, 1500);
+
+                // Store only non-empty leaves
+                this.leaves = [];
+                for (let i = 0; i < totalLeaves; i++) {
+                    if (buckets[i].length > 0) {
+                        this.leaves.push({ samples: buckets[i] });
+                    }
+                }
+            }
+
+            // Find nearest neighbor distance for given feature vector
+            findNearest(features) {
+                let bestDist = Infinity;
+                let bestIdx = -1;
+                const rowLen = FEATURE_DIM + 1;
+                for (const leaf of this.leaves) {
+                    for (const idx of leaf.samples) {
+                        const base = idx * rowLen;
+                        let d = 0;
+                        for (let k = 0; k < FEATURE_DIM; k++) {
+                            const diff = features[k] - this.data[base + k];
+                            d += diff * diff;
+                        }
+                        if (d < bestDist) {
+                            bestDist = d;
+                            bestIdx = idx;
+                        }
+                    }
+                }
+                return bestIdx >= 0 ? this.data[bestIdx * rowLen + FEATURE_DIM] : null;
+            }
+        }
+
+        // ---------- Distance & Feature Extraction ----------
+        function geometricDistance(a, b) {
+            return Math.hypot(b.x - a.x, b.y - a.y, b.z - a.z);
+        }
+
+        function extractFeatures(a, b, noiseLevel) {
+            const dist = geometricDistance(a, b);
+            const features = new Float32Array(FEATURE_DIM);
+            for (let s = 0; s < 5; s++) {
+                const dA = Math.hypot(a.x - SENSOR_X[s], a.y - SENSOR_Y[s], a.z - SENSOR_Z[s]);
+                const dB = Math.hypot(b.x - SENSOR_X[s], b.y - SENSOR_Y[s], b.z - SENSOR_Z[s]);
+                const tA = dA / SPEED_SOUND;
+                const tB = dB / SPEED_SOUND;
+                features[s * 2]     = (tA + tB) * 0.5 + (Math.random() - 0.5) * noiseLevel * 0.002;
+                features[s * 2 + 1] = (tB - tA) / (dist / 9.0 + 0.002) + (Math.random() - 0.5) * noiseLevel * 0.0015;
+            }
+            return features;
+        }
+
+        async function buildDistanceMatrix(cityCount, tree, noiseLevel, onProgress) {
+            const matrix = Array(cityCount).fill().map(() => Array(cityCount).fill(0));
+            const pairs = [];
+            for (let i = 0; i < cityCount; i++) {
+                for (let j = i + 1; j < cityCount; j++) {
+                    pairs.push([i, j]);
+                }
+            }
+            await chunkProcess(pairs.length, idx => {
+                const [i, j] = pairs[idx];
+                const features = extractFeatures(cities[i], cities[j], noiseLevel);
+                const estDist = tree.findNearest(features) || geometricDistance(cities[i], cities[j]);
+                matrix[i][j] = matrix[j][i] = estDist;
+            }, onProgress, 300);
+            return matrix;
+        }
+
+        // ---------- TSP Solvers ----------
+        function routeLength(route, matrix) {
+            let len = 0;
+            for (let i = 0; i < route.length - 1; i++) len += matrix[route[i]][route[i + 1]];
+            len += matrix[route[route.length - 1]][route[0]];
+            return len;
+        }
+
+        function shuffleArray(arr) {
+            for (let i = arr.length - 1; i > 0; i--) {
+                const j = Math.floor(Math.random() * (i + 1));
+                [arr[i], arr[j]] = [arr[j], arr[i]];
+            }
+            return arr;
+        }
+
+        function twoOpt(route, matrix, maxIter) {
+            let improved = true;
+            let iter = 0;
+            const n = route.length;
+            let best = [...route];
+            while (improved && iter++ < maxIter) {
+                improved = false;
+                for (let i = 0; i < n - 2; i++) {
+                    for (let j = i + 2; j < n; j++) {
+                        if (j === n - 1 && i === 0) continue;
+                        const current = matrix[best[i]][best[i + 1]] + matrix[best[j]][best[(j + 1) % n]];
+                        const swapped = matrix[best[i]][best[j]] + matrix[best[i + 1]][best[(j + 1) % n]];
+                        if (swapped < current - 0.001) {
+                            const segment = best.slice(i + 1, j + 1).reverse();
+                            best = [...best.slice(0, i + 1), ...segment, ...best.slice(j + 1)];
+                            improved = true;
+                        }
+                    }
+                }
+            }
+            return best;
+        }
+
+        async function solveTSP(matrix, startCount, maxIter, onProgress) {
+            const n = matrix.length;
+            let bestRoute = shuffleArray([...Array(n).keys()]);
+            let bestLen = routeLength(bestRoute, matrix);
+            await chunkProcess(startCount, k => {
+                const route = shuffleArray([...Array(n).keys()]);
+                const optimized = twoOpt(route, matrix, maxIter);
+                const len = routeLength(optimized, matrix);
+                if (len < bestLen) {
+                    bestLen = len;
+                    bestRoute = [...optimized];
+                }
+            }, onProgress, 150);
+            return { route: bestRoute, length: bestLen };
+        }
+
+        // Exact TSP for small N (brute force)
+        async function bruteForceTSP(matrix) {
+            const n = matrix.length;
+            if (n > 9) return null;
+            let bestLen = Infinity;
+            let bestRoute = null;
+            const path = [0];
+            const visited = new Uint8Array(n);
+            visited[0] = 1;
+            
+            function dfs(current, len) {
+                if (len >= bestLen) return;
+                if (path.length === n) {
+                    const total = len + matrix[current][0];
+                    if (total < bestLen) {
+                        bestLen = total;
+                        bestRoute = [...path];
+                    }
+                    return;
+                }
+                for (let i = 1; i < n; i++) {
+                    if (!visited[i]) {
+                        visited[i] = 1;
+                        path.push(i);
+                        dfs(i, len + matrix[current][i]);
+                        path.pop();
+                        visited[i] = 0;
+                    }
+                }
+            }
+            dfs(0, 0);
+            return { route: bestRoute, length: bestLen, exact: true };
+        }
+
+        // ---------- 3D Visualization ----------
+        function initThree() {
+            scene = new THREE.Scene();
+            scene.background = new THREE.Color(0x02040c);
+            scene.fog = new THREE.FogExp2(0x02040c, 0.002);
+            camera = new THREE.PerspectiveCamera(50, window.innerWidth / window.innerHeight, 0.2, 400);
+            camera.position.set(150, 130, 160);
+            renderer = new THREE.WebGLRenderer({ antialias: true });
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            document.body.appendChild(renderer.domElement);
+            labelRenderer = new CSS2DRenderer();
+            labelRenderer.setSize(window.innerWidth, window.innerHeight);
+            labelRenderer.domElement.style.position = 'absolute';
+            labelRenderer.domElement.style.top = '0px';
+            labelRenderer.domElement.style.pointerEvents = 'none';
+            document.body.appendChild(labelRenderer.domElement);
+            controls = new OrbitControls(camera, renderer.domElement);
+            controls.enableDamping = true;
+            controls.target.set(60, 60, 20);
+            
+            // Lighting
+            scene.add(new THREE.AmbientLight(0x224466));
+            const dirLight = new THREE.DirectionalLight(0xffcc99, 0.9);
+            dirLight.position.set(40, 80, 30);
+            scene.add(dirLight);
+            const grid = new THREE.GridHelper(180, 20, 0x66aaff, 0x335588);
+            grid.position.y = -2;
+            scene.add(grid);
+            
+            // Sensors
+            for (let i = 0; i < SENSOR_X.length; i++) {
+                const sphere = new THREE.Mesh(
+                    new THREE.SphereGeometry(1.2, 20, 20),
+                    new THREE.MeshStandardMaterial({ color: 0x3b82f6, emissive: 0x103050 })
+                );
+                sphere.position.set(SENSOR_X[i], SENSOR_Z[i], SENSOR_Y[i]);
+                scene.add(sphere);
+                const div = document.createElement('div');
+                div.textContent = `D${i}`;
+                div.style.color = '#aaf';
+                div.style.fontSize = '11px';
+                const label = new CSS2DObject(div);
+                label.position.set(SENSOR_X[i], SENSOR_Z[i] + 1.6, SENSOR_Y[i]);
+                scene.add(label);
+            }
+            
+            window.addEventListener('resize', () => {
+                camera.aspect = window.innerWidth / window.innerHeight;
+                camera.updateProjectionMatrix();
+                renderer.setSize(window.innerWidth, window.innerHeight);
+                labelRenderer.setSize(window.innerWidth, window.innerHeight);
+            });
+            generateCities(parseInt(citySlider.value));
+        }
+
+        function updateVisuals() {
+            cityMeshes.forEach(m => scene.remove(m));
+            cityMeshes = [];
+            cities.forEach((city, idx) => {
+                const sphere = new THREE.Mesh(
+                    new THREE.SphereGeometry(1.1, 20, 20),
+                    new THREE.MeshStandardMaterial({ color: 0xffaa55, emissive: 0x442200 })
+                );
+                sphere.position.set(city.x, city.z, city.y);
+                scene.add(sphere);
+                cityMeshes.push(sphere);
+                const div = document.createElement('div');
+                div.textContent = `${idx + 1}`;
+                div.style.color = '#ffbb77';
+                div.style.fontSize = '10px';
+                const label = new CSS2DObject(div);
+                label.position.set(city.x, city.z + 1.2, city.y);
+                scene.add(label);
+                cityMeshes.push(label);
+            });
+        }
+
+        function drawRoute(route) {
+            if (routeLine) scene.remove(routeLine);
+            if (!route || route.length < 2) return;
+            const points = route.map(i => new THREE.Vector3(cities[i].x, cities[i].z, cities[i].y));
+            points.push(points[0]);
+            const geometry = new THREE.BufferGeometry().setFromPoints(points);
+            const material = new THREE.LineBasicMaterial({ color: 0xffaa44, linewidth: 2 });
+            routeLine = new THREE.Line(geometry, material);
+            scene.add(routeLine);
+        }
+
+        // ---------- Main Execution ----------
+        async function runFullCycle() {
+            if (isRunning) return;
+            isRunning = true;
+            runBtn.disabled = true;
+            
+            const cityCount = parseInt(citySlider.value);
+            const noiseLevel = parseFloat(noiseSlider.value);
+            const startTime = performance.now();
+            const cfg = getAdaptiveConfig(cityCount);
+            formulaBox.textContent = `S=${cfg.starts.toLocaleString()} | B=${cfg.b1}×${cfg.b2} | M=${(cfg.samples / 1e3).toFixed(0)}k`;
+            
+            // 1. Build JitterTree
+            statusLine.textContent = `🌿 Building JitterTree...`;
+            progFill.style.width = '0%';
+            const tree = new JitterTree(cfg.b1, cfg.b2);
+            await tree.build(cfg.samples, noiseLevel, p => progFill.style.width = `${p * 30}%`);
+            
+            // 2. Build distance matrix
+            statusLine.textContent = `📡 Building ${cityCount}×${cityCount} matrix...`;
+            progFill.style.width = '30%';
+            const distMatrix = await buildDistanceMatrix(cityCount, tree, noiseLevel, p => progFill.style.width = `${30 + p * 20}%`);
+            
+            // 3. Compute baseline (exact for small N, heuristic otherwise)
+            statusLine.textContent = `📐 Computing baseline...`;
+            progFill.style.width = '50%';
+            let baseline;
+            if (cityCount <= 9) {
+                baseline = await bruteForceTSP(distMatrix);
+                noteLine.textContent = "✅ Global optimum proven (exact TSP)";
+            } else {
+                baseline = await solveTSP(distMatrix, Math.min(cfg.starts * 1.3, 400000), Math.min(cfg.maxIter * 1.2, 3500), p => progFill.style.width = `${50 + p * 10}%`);
+                noteLine.textContent = "🔍 N>9: comparison with enhanced heuristic";
+            }
+            progFill.style.width = '65%';
+            
+            // 4. Final TSP solve
+            statusLine.textContent = `🚀 Solving TSP...`;
+            const result = await solveTSP(distMatrix, cfg.starts, cfg.maxIter, p => progFill.style.width = `${65 + p * 30}%`);
+            
+            // Force UI update before final rendering
+            progFill.style.width = '100%';
+            await yieldToUI();
+            await yieldToUI();
+            
+            const foundLen = result.length;
+            const baseLen = baseline.length;
+            const accuracy = Math.min(100, (baseLen / foundLen) * 100);
+            const deviation = ((foundLen - baseLen) / baseLen) * 100;
+            const elapsed = ((performance.now() - startTime) / 1000).toFixed(1);
+            const coverage = (cfg.starts / Math.max(1, Math.floor(cityCount * cityCount / 6))).toFixed(2);
+            
+            statusLine.innerHTML = `⏱️ Time: <b>${elapsed} sec</b>`;
+            metricLine.innerHTML = `
+                📏 Found: <b>${foundLen.toFixed(1)}</b> m<br>
+                📐 Baseline: <b>${baseLen.toFixed(1)}</b> m ${baseline.exact ? '(exact)' : '(heuristic)'}<br>
+                🎯 <span class="highlight">Accuracy: ${accuracy.toFixed(1)}%</span><br>
+                📉 Deviation: <span style="color:${deviation > 0.5 ? '#ffaa44' : '#88ff88'}">${deviation > 0 ? '+' : ''}${deviation.toFixed(2)}%</span><br>
+                📊 Pool coverage: <b>${coverage}x</b>
+            `;
+            drawRoute(result.route);
+            
+            isRunning = false;
+            runBtn.disabled = false;
+        }
+
+        // Bootstrap
+        initThree();
+        function animate() {
+            controls.update();
+            renderer.render(scene, camera);
+            labelRenderer.render(scene, camera);
+            requestAnimationFrame(animate);
+        }
+        animate();
+        setTimeout(() => runFullCycle(), 400);
+    </script>
+</body>
+</html>
